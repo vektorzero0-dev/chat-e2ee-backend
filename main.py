@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import shutil
 from datetime import datetime
 from typing import List, Optional
@@ -6,11 +7,10 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 app = FastAPI(title="CyberCrypt Private Chat API")
 
-# Izinkan CORS
+# Izinkan CORS penuh
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,31 +19,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Buat folder untuk menyimpan media (Foto, Video, VN)
+# Buat folder untuk penyimpanan media (Foto, Video, VN)
 MEDIA_DIR = "uploaded_media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
 app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 
+# Inisialisasi Database SQLite Bawaan Python
+DB_FILE = "chat_database.db"
 
-# Model Database Pesan
-class Message(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    sender_id: str
-    receiver_id: str
-    msg_type: str  # text, image, video, audio, location
-    content: str  # Teks pesan, URL media, atau koordinat lat,long
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id TEXT NOT NULL,
+            receiver_id TEXT NOT NULL,
+            msg_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-
-sqlite_file_name = "chat_database.db"
-sqlite_url = f"sqlite:///{sqlite_file_name}"
-engine = create_engine(sqlite_url, connect_args={"check_same_thread": False})
-
-
-@app.on_event("startup")
-def on_startup():
-    SQLModel.metadata.create_all(engine)
-
+init_db()
 
 class MessageCreate(BaseModel):
     sender_id: str
@@ -51,17 +51,18 @@ class MessageCreate(BaseModel):
     msg_type: str
     content: str
 
-
-# 1. Endpoint Kirim Pesan (Teks / Lokasi)
+# 1. Endpoint Kirim Pesan
 @app.post("/messages")
 def send_message(msg: MessageCreate):
-    with Session(engine) as session:
-        db_msg = Message(**msg.dict())
-        session.add(db_msg)
-        session.commit()
-        session.refresh(db_msg)
-        return db_msg
-
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO messages (sender_id, receiver_id, msg_type, content) VALUES (?, ?, ?, ?)",
+        (msg.sender_id, msg.receiver_id, msg.msg_type, msg.content)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
 
 # 2. Endpoint Upload Media (Foto, Video, VN)
 @app.post("/upload")
@@ -71,19 +72,32 @@ def upload_file(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
     return {"url": f"/media/{os.path.basename(file_path)}"}
 
-
-# 3. Endpoint Ambil Riwayat Chat (Bisa dibaca kapan saja walau lawan bicara offline)
-@app.get("/messages/{user1_id}/{user2_id}", response_model=List[Message])
+# 3. Endpoint Ambil Riwayat Chat
+@app.get("/messages/{user1_id}/{user2_id}")
 def get_chat_history(user1_id: str, user2_id: str):
-    with Session(engine) as session:
-        statement = select(Message).where(
-            ((Message.sender_id == user1_id) & (Message.receiver_id == user2_id))
-            | ((Message.sender_id == user2_id) & (Message.receiver_id == user1_id))
-        ).order_by(Message.timestamp)
-        results = session.exec(statement).all()
-        return results
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT sender_id, receiver_id, msg_type, content, timestamp 
+        FROM messages 
+        WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
+        ORDER BY timestamp ASC
+    ''', (user1_id, user2_id, user2_id, user1_id))
+    
+    rows = cursor.fetchall()
+    conn.close()
 
+    history = []
+    for r in rows:
+        history.append({
+            "sender_id": r[0],
+            "receiver_id": r[1],
+            "msg_type": r[2],
+            "content": r[3],
+            "timestamp": r[4]
+        })
+    return history
 
 @app.get("/")
 def root():
-    return {"status": "online", "message": "Backend Private Chat Active"}
+    return {"status": "online", "message": "Backend Active"}
