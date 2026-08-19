@@ -1,49 +1,84 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+import sqlite3
+import json
 
 app = FastAPI()
 
-# Mengizinkan akses lintas domain (CORS) agar Frontend GitHub Pages bisa terhubung
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Class untuk mengelola koneksi real-time pengguna
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
+# Inisialisasi Database SQLite Lokal di Render
+def init_db():
+    conn = sqlite3.connect("chat.db")
+    c = conn.cursor()
+    # Tabel simpan kunci publik user
+    c.execute('''CREATE TABLE IF NOT EXISTS keys (user_id TEXT PRIMARY KEY, public_key TEXT)''')
+    # Tabel simpan pesan terenkripsi saat offline
+    c.execute('''CREATE TABLE IF NOT EXISTS pending_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_user TEXT, message TEXT)''')
+    conn.commit()
+    conn.close()
 
-    async def connect(self, user_id: str, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections[user_id] = websocket
+init_db()
 
-    def disconnect(self, user_id: str):
-        if user_id in self.active_connections:
-            del self.active_connections[user_id]
+active_connections = {}
 
-    async def send_payload(self, receiver_id: str, payload: dict):
-        if receiver_id in self.active_connections:
-            await self.active_connections[receiver_id].send_json(payload)
+@app.post("/register-key")
+async def register_key(data: dict):
+    conn = sqlite3.connect("chat.db")
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO keys (user_id, public_key) VALUES (?, ?)", (data["user_id"], data["public_key"]))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
 
-manager = ConnectionManager()
+@app.get("/get-key/{user_id}")
+async def get_key(user_id: str):
+    conn = sqlite3.connect("chat.db")
+    c = conn.cursor()
+    c.execute("SELECT public_key FROM keys WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"public_key": row[0]}
+    return {"error": "User tidak ditemukan"}, 404
 
-# Endpoint PING untuk Cron-job.org agar server Render tidak pernah tidur
-@app.get("/health")
-def health_check():
-    return {"status": "online", "message": "Server Backend Chat E2EE Aktif 24/7!"}
-
-# Endpoint WebSocket untuk jalur komunikasi real-time
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    await manager.connect(user_id, websocket)
+    await websocket.accept()
+    active_connections[user_id] = websocket
+
+    # 1. Ambil & kirim pesan tunda dari DB saat user baru online
+    conn = sqlite3.connect("chat.db")
+    c = conn.cursor()
+    c.execute("SELECT id, message FROM pending_messages WHERE to_user = ?", (user_id,))
+    pending = c.fetchall()
+    
+    for msg_id, msg_data in pending:
+        await websocket.send_text(msg_data)
+        c.execute("DELETE FROM pending_messages WHERE id = ?", (msg_id,))
+    
+    conn.commit()
+    conn.close()
+
     try:
         while True:
-            # Meneruskan data JSON (teks terenkripsi / link media terenkripsi) dari pengirim ke penerima
-            data = await websocket.receive_json()
-            await manager.send_payload(data["to"], data)
+            data_str = await websocket.receive_text()
+            data = json.loads(data_str)
+            target = data.get("to")
+
+            # 2. Jika target online, langsung kirim. Jika offline, simpan ke Database
+            if target in active_connections:
+                await active_connections[target].send_text(data_str)
+            else:
+                conn = sqlite3.connect("chat.db")
+                c = conn.cursor()
+                c.execute("INSERT INTO pending_messages (to_user, message) VALUES (?, ?)", (target, data_str))
+                conn.commit()
+                conn.close()
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
+        del active_connections[user_id]
