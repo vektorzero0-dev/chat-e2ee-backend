@@ -47,3 +47,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         if user_id in active_connections:
             del active_connections[user_id]
         print(f"[NODE_DISCONNECTED]: {user_id}")
+        @app.get("/health")
+def health_check():
+    return "OK"
